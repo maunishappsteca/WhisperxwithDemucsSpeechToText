@@ -231,7 +231,8 @@ def transcribe_audio(audio_path: str, model_size: str, language: Optional[str], 
     """Core transcription logic with optional translation"""
     try:
         model = load_model(model_size, language)
-        result = model.transcribe(audio_path, batch_size=BATCH_SIZE)
+        #result = model.transcribe(audio_path, batch_size=BATCH_SIZE)
+        result = model.transcribe(audio_path, batch_size=BATCH_SIZE, language=language if language and language != "-" else None, word_timestamps=True, vad_filter=True, condition_on_previous_text=False)
         detected_language = result.get("language", language if language else "en")
         
         if align and detected_language != "unknown":
