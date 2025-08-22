@@ -12,6 +12,7 @@ import logging
 from datetime import datetime
 import shutil
 import tempfile
+import torch
 
 # --- Configuration ---
 COMPUTE_TYPE = "float16"
@@ -38,6 +39,24 @@ logger = setup_logging()
 
 # S3 client
 s3 = boto3.client('s3') if S3_BUCKET else None
+
+# Device detection
+def get_device():
+    """Detect available device with CUDA fallback to CPU"""
+    try:
+        if torch.cuda.is_available():
+            device = "cuda"
+            logger.info(f"Using CUDA device: {torch.cuda.get_device_name(0)}")
+        else:
+            device = "cpu"
+            logger.warning("CUDA not available, falling back to CPU")
+        return device
+    except Exception as e:
+        logger.warning(f"Device detection failed: {str(e)}, falling back to CPU")
+        return "cpu"
+
+# Global device variable
+DEVICE = get_device()
 
 def ensure_model_cache_dir():
     try:
@@ -81,6 +100,7 @@ def separate_vocals_with_demucs(input_wav_path: str, model_name: str) -> str:
     os.makedirs(outdir, exist_ok=True)
     logger.info(f"Running Demucs '{model_name}' to isolate vocals...")
     try:
+        # Demucs doesn't support GPU selection via command line, but will use GPU if available
         subprocess.run(
             [
                 "python", "-m", "demucs.separate",
@@ -151,28 +171,60 @@ def prepare_audio_for_transcription(base_wav_path: str, use_vocal_isolation: boo
 def load_model(model_size: str, language: Optional[str]):
     if not ensure_model_cache_dir():
         raise RuntimeError("Model cache directory is not accessible")
-    return whisperx.load_model(
-        model_size,
-        device="cuda",
-        compute_type=COMPUTE_TYPE,
-        download_root=MODEL_CACHE_DIR,
-        language=language if language and language != "-" else None
-    )
+    
+    try:
+        return whisperx.load_model(
+            model_size,
+            device=DEVICE,
+            compute_type=COMPUTE_TYPE if DEVICE == "cuda" else "float32",
+            download_root=MODEL_CACHE_DIR,
+            language=language if language and language != "-" else None
+        )
+    except RuntimeError as e:
+        if "CUDA" in str(e) and "cuda" in str(e).lower():
+            logger.warning(f"CUDA error detected: {str(e)}. Falling back to CPU")
+            global DEVICE
+            DEVICE = "cpu"
+            return whisperx.load_model(
+                model_size,
+                device="cpu",
+                compute_type="float32",
+                download_root=MODEL_CACHE_DIR,
+                language=language if language and language != "-" else None
+            )
+        else:
+            raise
 
 def load_alignment_model(language_code: str):
     try:
-        return whisperx.load_align_model(language_code=language_code, device="cuda")
-    except Exception:
-        fallback_models = {
-            "hi": "theainerd/Wav2Vec2-large-xlsr-hindi",
-            "pt": "jonatasgrosman/wav2vec2-large-xlsr-53-portuguese",
-            "he": "imvladikon/wav2vec2-xls-r-300m-hebrew",
-        }
-        if language_code in fallback_models:
-            return whisperx.load_align_model(
-                model_name=fallback_models[language_code], device="cuda"
-            )
-        raise RuntimeError(f"No alignment model available for {language_code}")
+        return whisperx.load_align_model(language_code=language_code, device=DEVICE)
+    except RuntimeError as e:
+        if "CUDA" in str(e) and "cuda" in str(e).lower():
+            logger.warning(f"CUDA error in alignment model: {str(e)}. Falling back to CPU")
+            global DEVICE
+            DEVICE = "cpu"
+            return whisperx.load_align_model(language_code=language_code, device="cpu")
+        else:
+            fallback_models = {
+                "hi": "theainerd/Wav2Vec2-large-xlsr-hindi",
+                "pt": "jonatasgrosman/wav2vec2-large-xlsr-53-portuguese",
+                "he": "imvladikon/wav2vec2-xls-r-300m-hebrew",
+            }
+            if language_code in fallback_models:
+                try:
+                    return whisperx.load_align_model(
+                        model_name=fallback_models[language_code], device=DEVICE
+                    )
+                except RuntimeError as e2:
+                    if "CUDA" in str(e2) and "cuda" in str(e2).lower():
+                        logger.warning(f"CUDA error in fallback alignment model: {str(e2)}. Falling back to CPU")
+                        DEVICE = "cpu"
+                        return whisperx.load_align_model(
+                            model_name=fallback_models[language_code], device="cpu"
+                        )
+                    else:
+                        raise
+            raise RuntimeError(f"No alignment model available for {language_code}")
 
 def transcribe_audio(audio_path: str, model_size: str, language: Optional[str], align: bool):
     try:
@@ -200,7 +252,7 @@ def transcribe_audio(audio_path: str, model_size: str, language: Optional[str], 
                 align_model, metadata = load_alignment_model(detected_language)
                 aligned = whisperx.align(
                     result["segments"], align_model, metadata,
-                    audio_path, device="cuda", return_char_alignments=False
+                    audio_path, device=DEVICE, return_char_alignments=False
                 )
             except Exception as e:
                 logger.error(f"Alignment failed: {str(e)}")
@@ -221,7 +273,8 @@ def transcribe_audio(audio_path: str, model_size: str, language: Optional[str], 
             "segments": result["segments"],
             "language": detected_language,
             "model": model_size,
-            "alignment_success": "alignment_error" not in result
+            "alignment_success": "alignment_error" not in result,
+            "device_used": DEVICE  # Add device info to output
         }
     except Exception as e:
         logger.error(f"Transcription failed: {str(e)}")
@@ -282,6 +335,7 @@ def handler(job):
 
 if __name__ == "__main__":
     print("Starting WhisperX cuda Endpoint with Translation + Demucs Vocal Isolation...")
+    print(f"Using device: {DEVICE}")
     if not ensure_model_cache_dir():
         raise RuntimeError("Model cache directory is not accessible")
 
