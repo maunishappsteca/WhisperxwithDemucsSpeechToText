@@ -214,7 +214,7 @@ def transcribe_audio(audio_path: str, model_size: str, language: Optional[str], 
         # --- FIX 4: normalize schema → every segment has "words"
         for seg in result["segments"]:
             if "words" not in seg:
-                seg["words"] = []
+                seg["words"] = None
 
         return {
             "text": " ".join(seg["text"] for seg in result["segments"]),
