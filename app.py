@@ -234,10 +234,7 @@ def transcribe_audio(audio_path: str, model_size: str, language: Optional[str], 
         result = model.transcribe(
             audio_path,
             batch_size=BATCH_SIZE,
-            language=language if language and language != "-" else None,
-            word_timestamps=True,
-            vad_filter=True,
-            condition_on_previous_text=False
+            language=language if language and language != "-" else None
         )
 
         # --- FIX 2 & 3: language fallback if unknown
