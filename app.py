@@ -274,7 +274,8 @@ def handler(job):
             if audio_path and os.path.exists(audio_path):
                 os.remove(audio_path)
             gc.collect()
-
+            # Delete the file from S3
+            #s3.delete_object(Bucket=S3_BUCKET, Key=file_name)
         return result
     except Exception as e:
         return {"error": f"Unexpected error: {str(e)}"}
