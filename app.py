@@ -18,6 +18,7 @@ COMPUTE_TYPE = "float16"  # Changed to float16 for better cuda compatibility
 BATCH_SIZE = 16  # Reduced batch size for cuda
 S3_BUCKET = os.environ.get("S3_BUCKET_NAME")
 MODEL_CACHE_DIR = os.getenv("WHISPER_MODEL_CACHE", "/app/models")
+S3_OUTPUT_DIR = "output"  # Base directory for outputs
 
 # ### NEW: Demucs-related config
 DEMUCS_MODEL = os.getenv("DEMUCS_MODEL", "htdemucs")
@@ -262,25 +263,78 @@ def transcribe_audio(audio_path: str, model_size: str, language: Optional[str], 
         logger.error(f"Transcription failed: {str(e)}")
         raise RuntimeError(f"Transcription failed: {str(e)}")
 
+
+def save_response_to_s3(job_id, response_data, status="success"):
+    """
+    Save response to S3 bucket in the appropriate directory structure
+    
+    Args:
+        job_id: The ID of the job
+        response_data: The response data to save
+        status: Status of the job (success, error, failed)
+    """
+    if not S3_BUCKET:
+        logger.warning("S3_BUCKET not configured, skipping response save")
+        return False
+    
+    try:
+        # Create the directory path
+        directory_path = f"{S3_OUTPUT_DIR}/{job_id}/"
+        file_key = f"{directory_path}response.json"
+        
+        # Convert response to JSON string
+        response_json = json.dumps(response_data, indent=2, ensure_ascii=False)
+        
+        # Upload to S3
+        s3.put_object(
+            Bucket=S3_BUCKET,
+            Key=file_key,
+            Body=response_json,
+            ContentType='application/json'
+        )
+        
+        logger.info(f"Response saved to S3: s3://{S3_BUCKET}/{file_key}")
+        return True
+        
+    except Exception as e:
+        logger.error(f"Failed to save response to S3: {str(e)}")
+        return False
+
+
+
+
 def handler(job):
     """RunPod serverless handler"""
     try:
+        if not job.get("id"):
+            return {"error": "job id not found"}
+        
+        job_id = job["id"]
+    
+        # Initialize response variable
+        response = {}
         # Validate input
         if not job.get("input"):
-            return {"error": "No input provided"}
+            response = {"error": "No input provided", "job_id": job_id, "status": "failed"}
+            save_response_to_s3(job_id, response, "failed")
+            return response
             
         input_data = job["input"]
         file_name = input_data.get("file_name")
         
         if not file_name:
-            return {"error": "No file_name provided in input"}
+            response = {"error": "No file_name provided in input", "job_id": job_id, "status": "failed"}
+            save_response_to_s3(job_id, response, "failed")
+            return response
         
         # 1. Download from S3
         local_path = f"/tmp/{uuid.uuid4()}_{os.path.basename(file_name)}"
         try:
             s3.download_file(S3_BUCKET, file_name, local_path)
         except Exception as e:
-            return {"error": f"S3 download failed: {str(e)}"}
+            response = {"error": f"S3 download failed: {str(e)}", "job_id": job_id, "status": "failed"}
+            save_response_to_s3(job_id, response, "failed")
+            return response
         
         # 2. Convert to WAV (16 kHz mono) if needed
         try:
@@ -293,7 +347,9 @@ def handler(job):
                 os.remove(local_path)
                 audio_path = audio_path_16k
         except Exception as e:
-            return {"error": f"Audio processing failed: {str(e)}"}
+            response = {"error": f"Audio processing failed: {str(e)}", "job_id": job_id, "status": "failed"}
+            save_response_to_s3(job_id, response, "failed")
+            return response
 
         # 2b. ### NEW: Demucs vocal isolation + ffmpeg boost (optional, defaults on)
         use_isolation = bool(input_data.get("use_vocal_isolation", True))
@@ -320,8 +376,16 @@ def handler(job):
                 input_data.get("language", None),
                 input_data.get("align", False)
             )
+            result["job_id"] = job_id  # Include job ID in the result
+            result["status"] = "success"
+            logger.info(f"Transcription completed for job ID: {job_id}")
+            
+            # Save successful response
+            save_response_to_s3(job_id, result, "success")
+            response = result
         except Exception as e:
-            return {"error": str(e)}
+            response = {"error": str(e), "job_id": job_id, "status": "failed"}
+            save_response_to_s3(job_id, response, "failed")
         finally:
             # 4. Cleanup
             # Remove the processed file if it is not the original audio_path
@@ -330,18 +394,27 @@ def handler(job):
                     os.remove(processed_audio_path)
                 except Exception:
                     pass
+            
             if audio_path and os.path.exists(audio_path):
                 try:
                     os.remove(audio_path)
                 except Exception:
                     pass
+            
+            try :
+                s3.delete_object(Bucket=S3_BUCKET, Key=file_name)
+            except Exception:
+                    pass
+            
             gc.collect()
         
         # 5. Keep response structure IDENTICAL
-        return result
+        return response
         
     except Exception as e:
-        return {"error": f"Unexpected error: {str(e)}"}
+        response = {"error": f"Unexpected error: {str(e)}", "job_id": job_id, "status": "failed"}
+        save_response_to_s3(job_id, response, "failed")
+        return response
 
 if __name__ == "__main__":
     print("Starting WhisperX cuda Endpoint with Translation + Demucs Vocal Isolation...")
@@ -358,9 +431,10 @@ if __name__ == "__main__":
     else:
         # Test with mock input (demucs off for quick test)
         test_result = handler({
+            "id": "test-job-id-123",
             "input": {
                 "file_name": "test.wav",
-                "model_size": "base",
+                "model_size": "large-v3",
                 "language": "hi",
                 "align": True,
                 "use_vocal_isolation": True,
