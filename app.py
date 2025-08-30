@@ -10,8 +10,7 @@ from typing import Optional
 from botocore.exceptions import ClientError
 import logging
 from datetime import datetime
-import shutil  # ### NEW
-import tempfile  # ### NEW
+
 
 # --- Configuration ---
 COMPUTE_TYPE = "float16"  # Changed to float16 for better cuda compatibility
@@ -41,6 +40,87 @@ logger = setup_logging()
 
 # Initialize S3 client
 s3 = boto3.client('s3') if S3_BUCKET else None
+
+
+# ------------------- UTILITIES ------------------- #
+
+def list_files_with_size(directory: str):
+    """List files in a directory with size in MB"""
+    files_info = []
+    try:
+        for root, _, files in os.walk(directory):
+            for f in files:
+                fpath = os.path.join(root, f)
+                try:
+                    size_mb = os.path.getsize(fpath) / (1024 * 1024)
+                    files_info.append({
+                        "path": fpath,
+                        "size_mb": round(size_mb, 2)
+                    })
+                except Exception:
+                    pass
+    except Exception as e:
+        files_info.append({"error": str(e)})
+    return files_info
+def get_system_usage():
+    """Return disk, memory, and file listings"""
+    usage = {}
+    try:
+        # Disk usage
+        disk = subprocess.check_output(["df", "-h", "/"]).decode("utf-8").split("\n")[1].split()
+        usage["disk_total"] = disk[1]
+        usage["disk_used"] = disk[2]
+        usage["disk_available"] = disk[3]
+        usage["disk_percent"] = disk[4]
+
+        # Memory usage
+        mem_output = subprocess.check_output(["free", "-h"]).decode("utf-8").split("\n")
+        if len(mem_output) > 1:
+            mem_parts = mem_output[1].split()
+            usage["mem_total"] = mem_parts[1]
+            usage["mem_used"] = mem_parts[2]
+            usage["mem_free"] = mem_parts[3]
+            usage["mem_shared"] = mem_parts[4]
+            usage["mem_cache"] = mem_parts[5]
+            usage["mem_available"] = mem_parts[6]
+
+        # Files in tmp + cache
+        usage["tmp_files"] = list_files_with_size("/tmp")
+        usage["model_cache_files"] = list_files_with_size(MODEL_CACHE_DIR)
+
+        # Summarize downloaded models
+        usage["models_summary"] = []
+        if os.path.exists(MODEL_CACHE_DIR):
+            for subdir in os.listdir(MODEL_CACHE_DIR):
+                model_path = os.path.join(MODEL_CACHE_DIR, subdir)
+                if os.path.isdir(model_path):
+                    total_size_mb = 0
+                    for root, _, files in os.walk(model_path):
+                        for f in files:
+                            try:
+                                total_size_mb += os.path.getsize(os.path.join(root, f))
+                            except:
+                                pass
+                    usage["models_summary"].append({
+                        "model_name": subdir,
+                        "size_mb": round(total_size_mb / (1024 * 1024), 2)
+                    })
+
+    except Exception as e:
+        usage["error"] = str(e)
+    return usage
+
+def ensure_model_cache_dir():
+    """Ensure cache dirs exist"""
+    try:
+        os.makedirs(MODEL_CACHE_DIR, exist_ok=True)
+        os.makedirs(DEMUCS_CACHE_DIR, exist_ok=True)
+        return True
+    except Exception as e:
+        logger.error(f"Model cache directory error: {str(e)}")
+        return False
+
+# ------------------- MAIN HANDLER ------------------- #
 
 def ensure_model_cache_dir():
     """Ensure model cache directory exists and is accessible"""
@@ -313,6 +393,7 @@ def handler(job):
     
         # Initialize response variable
         response = {}
+        
         # Validate input
         if not job.get("input"):
             response = {"error": "No input provided", "job_id": job_id, "status": "failed"}
@@ -386,28 +467,74 @@ def handler(job):
         except Exception as e:
             response = {"error": str(e), "job_id": job_id, "status": "failed"}
             save_response_to_s3(job_id, response, "failed")
+
+
         finally:
-            # 4. Cleanup
-            # Remove the processed file if it is not the original audio_path
+            # 4. Cleanup - Remove ALL temporary files
+            files_to_remove = []
+            directories_to_remove = []
+            
+            # Add main audio files
             if processed_audio_path and os.path.exists(processed_audio_path) and processed_audio_path != audio_path:
-                try:
-                    os.remove(processed_audio_path)
-                except Exception:
-                    pass
+                files_to_remove.append(processed_audio_path)
             
             if audio_path and os.path.exists(audio_path):
-                try:
-                    os.remove(audio_path)
-                except Exception:
-                    pass
+                files_to_remove.append(audio_path)
             
-            try :
-                s3.delete_object(Bucket=S3_BUCKET, Key=file_name)
+            # Add local_path if it still exists (in case of early errors)
+            if local_path and os.path.exists(local_path):
+                files_to_remove.append(local_path)
+            
+            # Find and add all Demucs temporary directories
+            try:
+                for item in os.listdir('/tmp'):
+                    if item.startswith('demucs_'):
+                        demucs_dir = os.path.join('/tmp', item)
+                        if os.path.isdir(demucs_dir):
+                            directories_to_remove.append(demucs_dir)
             except Exception:
-                    pass
+                pass
+            
+            # Find and add all boosted vocal files
+            try:
+                for item in os.listdir('/tmp'):
+                    if item.endswith('_vocals_boosted.wav'):
+                        boosted_file = os.path.join('/tmp', item)
+                        if os.path.isfile(boosted_file):
+                            files_to_remove.append(boosted_file)
+            except Exception:
+                pass
+            
+            # Remove all files
+            for file_path in files_to_remove:
+                try:
+                    if os.path.exists(file_path):
+                        os.remove(file_path)
+                        logger.info(f"Removed temporary file: {file_path}")
+                except Exception as e:
+                    logger.warning(f"Failed to remove file {file_path}: {str(e)}")
+            
+            # Remove all directories (with their contents)
+            for dir_path in directories_to_remove:
+                try:
+                    if os.path.exists(dir_path):
+                        import shutil
+                        shutil.rmtree(dir_path)
+                        logger.info(f"Removed temporary directory: {dir_path}")
+                except Exception as e:
+                    logger.warning(f"Failed to remove directory {dir_path}: {str(e)}")
+            
+            # Delete from S3
+            # try:
+            #     s3.delete_object(Bucket=S3_BUCKET, Key=file_name)
+            #     logger.info(f"Deleted S3 file: {file_name}")
+            # except Exception as e:
+            #     logger.warning(f"Failed to delete S3 file {file_name}: {str(e)}")
             
             gc.collect()
         
+        response["system_usage"] = get_system_usage()
+
         # 5. Keep response structure IDENTICAL
         return response
         
