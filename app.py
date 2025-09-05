@@ -467,69 +467,25 @@ def handler(job):
         except Exception as e:
             response = {"error": str(e), "job_id": job_id, "status": "failed"}
             save_response_to_s3(job_id, response, "failed")
-
-
         finally:
-            # 4. Cleanup - Remove ALL temporary files
-            files_to_remove = []
-            directories_to_remove = []
-            
-            # Add main audio files
+            # 4. Cleanup
+            # Remove the processed file if it is not the original audio_path
             if processed_audio_path and os.path.exists(processed_audio_path) and processed_audio_path != audio_path:
-                files_to_remove.append(processed_audio_path)
+                try:
+                    os.remove(processed_audio_path)
+                except Exception:
+                    pass
             
             if audio_path and os.path.exists(audio_path):
-                files_to_remove.append(audio_path)
-            
-            # Add local_path if it still exists (in case of early errors)
-            if local_path and os.path.exists(local_path):
-                files_to_remove.append(local_path)
-            
-            # Find and add all Demucs temporary directories
-            try:
-                for item in os.listdir('/tmp'):
-                    if item.startswith('demucs_'):
-                        demucs_dir = os.path.join('/tmp', item)
-                        if os.path.isdir(demucs_dir):
-                            directories_to_remove.append(demucs_dir)
-            except Exception:
-                pass
-            
-            # Find and add all boosted vocal files
-            try:
-                for item in os.listdir('/tmp'):
-                    if item.endswith('_vocals_boosted.wav'):
-                        boosted_file = os.path.join('/tmp', item)
-                        if os.path.isfile(boosted_file):
-                            files_to_remove.append(boosted_file)
-            except Exception:
-                pass
-            
-            # Remove all files
-            for file_path in files_to_remove:
                 try:
-                    if os.path.exists(file_path):
-                        os.remove(file_path)
-                        logger.info(f"Removed temporary file: {file_path}")
-                except Exception as e:
-                    logger.warning(f"Failed to remove file {file_path}: {str(e)}")
+                    os.remove(audio_path)
+                except Exception:
+                    pass
             
-            # Remove all directories (with their contents)
-            for dir_path in directories_to_remove:
-                try:
-                    if os.path.exists(dir_path):
-                        import shutil
-                        shutil.rmtree(dir_path)
-                        logger.info(f"Removed temporary directory: {dir_path}")
-                except Exception as e:
-                    logger.warning(f"Failed to remove directory {dir_path}: {str(e)}")
-            
-            # Delete from S3
-            # try:
-            #     s3.delete_object(Bucket=S3_BUCKET, Key=file_name)
-            #     logger.info(f"Deleted S3 file: {file_name}")
-            # except Exception as e:
-            #     logger.warning(f"Failed to delete S3 file {file_name}: {str(e)}")
+            try :
+                s3.delete_object(Bucket=S3_BUCKET, Key=file_name)
+            except Exception:
+                    pass
             
             gc.collect()
         
