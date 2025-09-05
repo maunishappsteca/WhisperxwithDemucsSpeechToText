@@ -481,12 +481,7 @@ def handler(job):
                     os.remove(audio_path)
                 except Exception:
                     pass
-            
-            try :
-                s3.delete_object(Bucket=S3_BUCKET, Key=file_name)
-            except Exception:
-                    pass
-            
+                
             gc.collect()
         
         response["system_usage"] = get_system_usage()
