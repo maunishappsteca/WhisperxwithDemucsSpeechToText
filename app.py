@@ -10,6 +10,8 @@ from typing import Optional
 from botocore.exceptions import ClientError
 import logging
 from datetime import datetime
+import torch
+import shutil
 
 
 # --- Configuration ---
@@ -41,8 +43,28 @@ logger = setup_logging()
 # Initialize S3 client
 s3 = boto3.client('s3') if S3_BUCKET else None
 
+# Model cache for performance optimization
+model_cache = {}
 
 # ------------------- UTILITIES ------------------- #
+
+def get_gpu_memory_usage():
+    if torch.cuda.is_available():
+        return {
+            "allocated": torch.cuda.memory_allocated() / 1024**3,
+            "cached": torch.cuda.memory_reserved() / 1024**3,
+            "max_allocated": torch.cuda.max_memory_allocated() / 1024**3,
+            "max_cached": torch.cuda.max_memory_reserved() / 1024**3
+        }
+    return {}
+
+# Add this after your imports
+def clear_gpu_memory():
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+        gc.collect()
+
 
 def list_files_with_size(directory: str):
     """List files in a directory with size in MB"""
@@ -108,17 +130,11 @@ def get_system_usage():
 
     except Exception as e:
         usage["error"] = str(e)
+
+    # Add GPU memory info
+    usage["gpu_memory"] = get_gpu_memory_usage()
     return usage
 
-def ensure_model_cache_dir():
-    """Ensure cache dirs exist"""
-    try:
-        os.makedirs(MODEL_CACHE_DIR, exist_ok=True)
-        os.makedirs(DEMUCS_CACHE_DIR, exist_ok=True)
-        return True
-    except Exception as e:
-        logger.error(f"Model cache directory error: {str(e)}")
-        return False
 
 # ------------------- MAIN HANDLER ------------------- #
 
@@ -262,18 +278,36 @@ def prepare_audio_for_transcription(
 
 def load_model(model_size: str, language: Optional[str]):
     """Load Whisper model with GPU optimization"""
+    cache_key = f"{model_size}_{language if language else 'no_lang'}"
+    
+    if cache_key in model_cache:
+        logger.info(f"Using cached model: {cache_key}")
+        return model_cache[cache_key]
+    
     try:
         if not ensure_model_cache_dir():
             logger.error(f"Model cache directory is not accessible")
             raise RuntimeError("Model cache directory is not accessible")
             
-        return whisperx.load_model(
+        # return whisperx.load_model(
+        #     model_size,
+        #     device="cuda",
+        #     compute_type=COMPUTE_TYPE,
+        #     download_root=MODEL_CACHE_DIR,
+        #     language=language if language and language != "-" else None
+        # )
+
+        model = whisperx.load_model(
             model_size,
             device="cuda",
             compute_type=COMPUTE_TYPE,
             download_root=MODEL_CACHE_DIR,
             language=language if language and language != "-" else None
         )
+        
+        model_cache[cache_key] = model
+        return model
+    
     except Exception as e:
         logger.error(f"Model loading failed: {str(e)}")
         raise RuntimeError(f"Model loading failed: {str(e)}")
@@ -313,7 +347,6 @@ def transcribe_audio(audio_path: str, model_size: str, language: Optional[str], 
     try:
         model = load_model(model_size, language)
         result = model.transcribe(audio_path, batch_size=BATCH_SIZE)
-        #result = model.transcribe(audio_path, batch_size=BATCH_SIZE, language=language if language and language != "-" else None, word_timestamps=True, vad_filter=True, condition_on_previous_text=False)
         detected_language = result.get("language", language if language else "en")
         
         if align and detected_language != "unknown":
@@ -379,9 +412,6 @@ def save_response_to_s3(job_id, response_data, status="success"):
     except Exception as e:
         logger.error(f"Failed to save response to S3: {str(e)}")
         return False
-
-
-
 
 def handler(job):
     """RunPod serverless handler"""
@@ -467,24 +497,78 @@ def handler(job):
         except Exception as e:
             response = {"error": str(e), "job_id": job_id, "status": "failed"}
             save_response_to_s3(job_id, response, "failed")
+
+
         finally:
-            # 4. Cleanup
-            # Remove the processed file if it is not the original audio_path
+            # 4. Cleanup - Remove ALL temporary files
+            files_to_remove = []
+            directories_to_remove = []
+            
+            # Add main audio files
             if processed_audio_path and os.path.exists(processed_audio_path) and processed_audio_path != audio_path:
-                try:
-                    os.remove(processed_audio_path)
-                except Exception:
-                    pass
+                files_to_remove.append(processed_audio_path)
             
             if audio_path and os.path.exists(audio_path):
+                files_to_remove.append(audio_path)
+            
+            # Add local_path if it still exists (in case of early errors)
+            if local_path and os.path.exists(local_path):
+                files_to_remove.append(local_path)
+            
+            # Find and add all Demucs temporary directories
+            try:
+                for item in os.listdir('/tmp'):
+                    if item.startswith('demucs_'):
+                        demucs_dir = os.path.join('/tmp', item)
+                        if os.path.isdir(demucs_dir):
+                            directories_to_remove.append(demucs_dir)
+            except Exception:
+                pass
+            
+            # Find and add all boosted vocal files
+            try:
+                for item in os.listdir('/tmp'):
+                    if item.endswith('_vocals_boosted.wav'):
+                        boosted_file = os.path.join('/tmp', item)
+                        if os.path.isfile(boosted_file):
+                            files_to_remove.append(boosted_file)
+            except Exception:
+                pass
+            
+            # Remove all files
+            for file_path in files_to_remove:
                 try:
-                    os.remove(audio_path)
-                except Exception:
-                    pass
-                
+                    if os.path.exists(file_path):
+                        os.remove(file_path)
+                        logger.info(f"Removed temporary file: {file_path}")
+                except Exception as e:
+                    logger.warning(f"Failed to remove file {file_path}: {str(e)}")
+            
+            # Remove all directories (with their contents)
+            for dir_path in directories_to_remove:
+                try:
+                    if os.path.exists(dir_path):
+                        import shutil
+                        shutil.rmtree(dir_path)
+                        logger.info(f"Removed temporary directory: {dir_path}")
+                except Exception as e:
+                    logger.warning(f"Failed to remove directory {dir_path}: {str(e)}")
+            
+            clear_gpu_memory()
+            # Delete from S3
+            # try:
+            #     s3.delete_object(Bucket=S3_BUCKET, Key=file_name)
+            #     logger.info(f"Deleted S3 file: {file_name}")
+            # except Exception as e:
+            #     logger.warning(f"Failed to delete S3 file {file_name}: {str(e)}")
+            
             gc.collect()
         
         response["system_usage"] = get_system_usage()
+
+        # Add this to your system_usage output
+        response["gpu_memory"] = get_gpu_memory_usage()
+
 
         # 5. Keep response structure IDENTICAL
         return response
